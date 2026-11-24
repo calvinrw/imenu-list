@@ -5,7 +5,7 @@
 ;; Author: Bar Magal (2015)
 ;; Version: 0.9
 ;; Homepage: https://github.com/bmag/imenu-list
-;; Package-Requires: ((emacs "24.3"))
+;; Package-Requires: ((emacs "26.1"))
 
 ;; This file is not part of GNU Emacs.
 
@@ -84,6 +84,16 @@ when paired with window-purpose's x-code-1 configuration.
 If you kill buffers often, set this to nil so x-code-1 will clear
 the entries when focusing on a buffer that does not have an Imenu
 index."
+  :group 'imenu-list
+  :type 'boolean)
+
+(defcustom imenu-list-ignore-side-windows nil
+  "Whether to leave the imenu-list buffer alone in side windows.
+If non-nil, automatic updates are skipped while a side window (see
+`display-buffer-in-side-window') is selected, so the imenu-list buffer
+keeps showing the entries of the last ordinary window's buffer.  This
+suits layouts that put imenu-list next to other side windows, such as
+a directory tree."
   :group 'imenu-list
   :type 'boolean)
 
@@ -212,10 +222,63 @@ current entry (current entry is a \"father\")."
   (setq imenu--index-alist nil)
   (imenu--make-index-alist))
 
+(defvar-local imenu-list--index-tick nil
+  "`buffer-chars-modified-tick' when this buffer's index was last built.")
+
+(defun imenu-list--parent-position (entry)
+  "Position of parent ENTRY's own line in its buffer, if it has one.
+Org's index gives a heading with subheadings a position of its own, as
+an `org-imenu-marker' text property on its name."
+  (and (imenu--subalist-p entry)
+       (stringp (car entry))
+       (let ((pos (get-text-property 0 'org-imenu-marker (car entry))))
+         (and (number-or-marker-p pos) pos))))
+
+(defun imenu-list--freeze-entries (alist)
+  "Copy index ALIST with every marker replaced by its position.
+Org discards the markers in its index whenever the index is rebuilt
+\(e.g. by other users of Imenu, like `which-function-mode' or
+breadcrumb), which would leave the imenu-list entries pointing nowhere.
+
+Org also lists each heading that has subheadings twice: as a parent,
+and again as a plain entry right after it.  The parent has its own
+position (see `imenu-list--parent-position'), so the duplicate is
+dropped."
+  (let (parent-names)
+    (dolist (entry alist)
+      (when (imenu--subalist-p entry)
+        (push (car entry) parent-names)))
+    (setq alist (cl-remove-if (lambda (entry)
+                                (and (not (imenu--subalist-p entry))
+                                     (memq (car entry) parent-names)))
+                              alist)))
+  (mapcar
+   (lambda (entry)
+     (let ((name (car entry)))
+       (if (imenu--subalist-p entry)
+           (let ((m (and (stringp name)
+                         (get-text-property 0 'org-imenu-marker name))))
+             (when (markerp m)
+               (setq name (copy-sequence name))
+               (put-text-property 0 (length name) 'org-imenu-marker
+                                  (marker-position m) name))
+             (cons name (imenu-list--freeze-entries (cdr entry))))
+         (if (markerp (cdr entry))
+             (cons name (marker-position (cdr entry)))
+           entry))))
+   alist))
+
 (defun imenu-list-collect-entries ()
-  "Collect all `imenu' entries of the current buffer."
-  (imenu-list-rescan-imenu)
-  (setq imenu-list--imenu-entries imenu--index-alist)
+  "Collect all `imenu' entries of the current buffer.
+The index is only rebuilt when the buffer's text changed since it was
+last built.  Markers in it are replaced by positions (see
+`imenu-list--freeze-entries')."
+  (if (eql imenu-list--index-tick (buffer-chars-modified-tick))
+      (imenu--make-index-alist)         ; rebuilt only if someone cleared it
+    (imenu-list-rescan-imenu))
+  (setq imenu-list--index-tick (buffer-chars-modified-tick))
+  (setq imenu-list--imenu-entries
+        (imenu-list--freeze-entries imenu--index-alist))
   (setq imenu-list--displayed-buffer (current-buffer)))
 
 
@@ -241,8 +304,10 @@ EVENT holds the data of what was clicked."
         (imenu-list-goto-entry)))))
 
 (defun imenu-list--action-toggle-hs (event)
-  "Toggle hide/show state of current block.
-EVENT holds the data of what was clicked.
+  "Jump to the clicked parent entry, or toggle its hide/show state.
+Parent entries with a position of their own (see
+`imenu-list--parent-position') are jumped to; others are folded or
+unfolded.  EVENT holds the data of what was clicked.
 See `hs-minor-mode' for information on what is hide/show."
   (let ((window (posn-window (event-end event)))
         (pos (posn-point (event-end event)))
@@ -251,7 +316,9 @@ See `hs-minor-mode' for information on what is hide/show."
                (eql (window-buffer window) ilist-buffer))
       (with-current-buffer ilist-buffer
         (goto-char pos)
-        (hs-toggle-hiding)))))
+        (if (imenu-list--jump-target (imenu-list--find-entry))
+            (imenu-list-goto-entry)
+          (hs-toggle-hiding))))))
 
 (defun imenu-list--insert-entry (entry depth)
   "Insert a line for ENTRY with DEPTH."
@@ -286,18 +353,66 @@ Each entry is appended to `imenu-list--line-entries' as well."
     (when (imenu--subalist-p entry)
       (imenu-list--insert-entries-internal (cdr entry) (1+ depth)))))
 
+(defvar imenu-list--rendered-buffer nil
+  "The buffer whose entries the imenu-list buffer was last drawn for.")
+
+(defvar-local imenu-list--folds nil
+  "Folded imenu-list lines for this buffer: a list of (TEXT . OCCURRENCE).
+OCCURRENCE counts identical lines above, so duplicates can be told apart.")
+
+(defun imenu-list--fold-keys ()
+  "Keys of the folded lines in the current (imenu-list) buffer."
+  (let (keys)
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (overlay-get ov 'hs)
+        (save-excursion
+          (goto-char (overlay-start ov))
+          (beginning-of-line)
+          (let ((text (buffer-substring-no-properties
+                       (point) (line-end-position)))
+                (n 0))
+            (while (re-search-backward
+                    (concat "^" (regexp-quote text) "$") nil t)
+              (setq n (1+ n)))
+            (push (cons text n) keys)))))
+    keys))
+
+(defun imenu-list--apply-fold-keys (keys)
+  "Fold the lines in KEYS in the current (imenu-list) buffer."
+  (save-excursion
+    (dolist (key keys)
+      (goto-char (point-min))
+      (when (re-search-forward
+             (concat "^" (regexp-quote (car key)) "$") nil t (1+ (cdr key)))
+        (beginning-of-line)
+        (ignore-errors (hs-hide-block))))))
+
 (defun imenu-list-insert-entries ()
   "Insert all imenu entries into the current buffer.
 The entries are taken from `imenu-list--imenu-entries'.
 Each entry is inserted in its own line.
 Each entry is appended to `imenu-list--line-entries' as well
  (`imenu-list--line-entries' is cleared in the beginning of this
-function)."
+function).
+Which entries are folded is remembered for each displayed buffer, and
+restored when its entries are drawn again."
+  (when (buffer-live-p imenu-list--rendered-buffer)
+    (let ((keys (imenu-list--fold-keys)))
+      (with-current-buffer imenu-list--rendered-buffer
+        (setq imenu-list--folds keys))))
   (let ((inhibit-read-only t))
     (erase-buffer)
     (setq imenu-list--line-entries nil)
     (imenu-list--insert-entries-internal imenu-list--imenu-entries 0)
-    (setq imenu-list--line-entries (nreverse imenu-list--line-entries))))
+    (setq imenu-list--line-entries (nreverse imenu-list--line-entries))
+    (setq imenu-list--rendered-buffer imenu-list--displayed-buffer)
+    (when (buffer-live-p imenu-list--rendered-buffer)
+      (imenu-list--apply-fold-keys
+       (buffer-local-value 'imenu-list--folds imenu-list--rendered-buffer))
+      (unless imenu-list--imenu-entries
+        (insert (propertize (format "No outline for %s"
+                                    (buffer-name imenu-list--rendered-buffer))
+                            'face 'shadow))))))
 
 
 ;;; goto entries
@@ -321,10 +436,19 @@ buffer, or in other words: this hook is ran by both
   (run-hooks 'imenu-list-after-jump-hook)
   (imenu-list--show-current-entry))
 
+(defun imenu-list--jump-target (entry)
+  "ENTRY in a form `imenu' can jump to, or nil if it has no position.
+Parent entries can be jumped to when they have a position of their
+own (see `imenu-list--parent-position')."
+  (cond ((not (imenu--subalist-p entry)) entry)
+        ((imenu-list--parent-position entry)
+         (cons (car entry) (imenu-list--parent-position entry)))))
+
 (defun imenu-list-goto-entry ()
   "Switch to the original buffer and display the entry under point."
   (interactive)
-  (imenu-list--goto-entry (imenu-list--find-entry)))
+  (when-let* ((target (imenu-list--jump-target (imenu-list--find-entry))))
+    (imenu-list--goto-entry target)))
 
 (defun imenu-list-display-entry ()
   "Display the symbol under `point' in the original buffer."
@@ -333,12 +457,12 @@ buffer, or in other words: this hook is ran by both
     (imenu-list-goto-entry)))
 
 (defun imenu-list-ret-dwim ()
-  "Jump to or toggle the entry at `point'."
+  "Jump to or toggle the entry at `point'.
+Parent entries without a position of their own are toggled."
   (interactive)
-  (let ((entry (imenu-list--find-entry)))
-    (if (imenu--subalist-p entry)
-        (hs-toggle-hiding)
-      (imenu-list--goto-entry entry))))
+  (if-let* ((target (imenu-list--jump-target (imenu-list--find-entry))))
+      (imenu-list--goto-entry target)
+    (hs-toggle-hiding)))
 
 (defun imenu-list-display-dwim ()
   "Display or toggle the entry at `point'."
@@ -395,25 +519,31 @@ continue with the regular logic to find a translator function."
    (t #'identity)))
 
 (defun imenu-list--current-entry ()
-  "Find entry in `imenu-list--line-entries' matching current position."
-  (let ((point-pos (point-marker))
-        (offset (point-min-marker))
+  "Find entry in `imenu-list--line-entries' matching current position.
+That's the last entry (in buffer order) that starts at or before
+point, including parent entries with a position of their own (see
+`imenu-list--parent-position')."
+  (let ((point-pos (point))
+        (offset (point-min))
         (get-pos-fn (imenu-list-position-translator))
         match-entry)
     (dolist (entry imenu-list--line-entries match-entry)
-      ;; "special entry" is described in `imenu--index-alist'
-      (unless (imenu--subalist-p entry)
-        (let* ((is-special-entry (listp (cdr entry)))
-               (entry-pos-raw (if is-special-entry
-                                  (cadr entry)
-                                (cdr entry)))
-               ;; sometimes imenu doesn't use numbers/markers as positions, so we
-               ;; need to translate them back to "real" positions
-               ;; (see https://github.com/bmag/imenu-list/issues/20)
-               (entry-pos (funcall get-pos-fn entry-pos-raw)))
-          (when (imenu-list-<= offset entry-pos point-pos)
-            (setq offset entry-pos)
-            (setq match-entry entry)))))))
+      (let ((entry-pos
+             (if (imenu--subalist-p entry)
+                 (imenu-list--parent-position entry)
+               ;; "special entry" is described in `imenu--index-alist'
+               (let* ((is-special-entry (listp (cdr entry)))
+                      (entry-pos-raw (if is-special-entry
+                                         (cadr entry)
+                                       (cdr entry))))
+                 ;; sometimes imenu doesn't use numbers/markers as positions, so we
+                 ;; need to translate them back to "real" positions
+                 ;; (see https://github.com/bmag/imenu-list/issues/20)
+                 (ignore-errors (funcall get-pos-fn entry-pos-raw))))))
+        (when (and (number-or-marker-p entry-pos)
+                   (imenu-list-<= offset entry-pos point-pos))
+          (setq offset entry-pos)
+          (setq match-entry entry))))))
 
 (defun imenu-list--show-current-entry ()
   "Move the imenu-list buffer's point to the current position's entry."
@@ -424,6 +554,12 @@ continue with the regular logic to find a translator function."
       (with-selected-window (get-buffer-window (imenu-list-get-buffer-create))
         (goto-char (point-min))
         (forward-line line-number)
+        ;; Inside a fold: highlight the folded parent instead.
+        (let ((folds (cl-remove-if-not (lambda (ov) (overlay-get ov 'hs))
+                                       (overlays-at (point)))))
+          (when folds
+            (goto-char (apply #'min (mapcar #'overlay-start folds)))
+            (beginning-of-line)))
         (hl-line-mode 1)))))
 
 ;;; window display settings
@@ -534,22 +670,38 @@ If FORCE-UPDATE is non-nil, the imenu-list buffer is updated even if the
 imenu entries did not change since the last update."
   (catch 'index-failure
     (let ((old-entries imenu-list--imenu-entries)
+          (old-buffer imenu-list--displayed-buffer)
           (location (point-marker)))
-      ;; don't update if `point' didn't move - fixes issue #11
-      (unless (and (null force-update)
-                   imenu-list--last-location
-                   (marker-buffer imenu-list--last-location)
-                   (= location imenu-list--last-location))
+      ;; don't update if `point' didn't move - fixes issue #11.  Markers in
+      ;; different buffers compare by position alone, so check the buffer too.
+      (unless (or (and (null force-update)
+                       imenu-list--last-location
+                       (eq (marker-buffer imenu-list--last-location)
+                           (current-buffer))
+                       (= location imenu-list--last-location))
+                  ;; Not the imenu-list buffer itself, the minibuffer, or
+                  ;; (optionally) other side windows.
+                  (and (null force-update)
+                       (or (equal (buffer-name) imenu-list-buffer-name)
+                           (window-minibuffer-p)
+                           (and imenu-list-ignore-side-windows
+                                (window-parameter (selected-window)
+                                                  'window-side)))))
         (setq imenu-list--last-location location)
         (condition-case err
             (imenu-list-collect-entries)
-          (imenu-unavailable (if imenu-list-persist-when-imenu-index-unavailable
-                                 (throw 'index-failure nil)
-                               (imenu-list-clear))))
+          ((imenu-unavailable error)
+           (if imenu-list-persist-when-imenu-index-unavailable
+               (throw 'index-failure nil)
+             ;; Redrawn below, which saves the previous buffer's folds
+             ;; and says there's no outline.
+             (setq imenu-list--imenu-entries nil
+                   imenu-list--displayed-buffer (current-buffer)))))
         (when (or force-update
                   ;; check if Ilist buffer is alive, in case it was killed
                   ;; since last update
                   (null (get-buffer imenu-list-buffer-name))
+                  (not (eq old-buffer imenu-list--displayed-buffer))
                   (not (equal old-entries imenu-list--imenu-entries)))
           (with-current-buffer (imenu-list-get-buffer-create)
             (imenu-list-insert-entries)))
